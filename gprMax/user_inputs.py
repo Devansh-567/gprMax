@@ -472,6 +472,16 @@ class SubgridUserInput(MainGridUserInput[SubGridBaseGrid]):
 
         self.outer_bound = np.subtract([grid.nx, grid.ny, grid.nz], self.inner_bound)
 
+        # Enable dispersive material averaging in subgrid.
+        # This is opt-in because compound materials may have more poles
+        # than their constituents, increasing subgrid-wide dispersive memory.
+        self.dispersive_averaging = False
+
+        # When enabled, Debye, Lorentz, and Drude materials participate in the
+        # subgrid boundary averaging used for nondispersive dielectric materials.
+        # The exact effective material retains every distinct inclusive pole and
+        # scales each residue by its cell weight.
+
     def translate_to_gap(self, p) -> npt.NDArray[np.int32]:
         """Translates the user input point to the real point in the subgrid."""
 

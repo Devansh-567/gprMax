@@ -84,6 +84,11 @@ class SubGridBaseGrid(FDTDGrid, ABC):
         # degrees used only by refining HSG interfaces.
         self.interpolation = 0 if self.equal_resolution else kwargs["interpolation"]
 
+        # Enable dispersive material averaging in subgrid.
+        # This is opt-in because compound materials may have more poles
+        # than their constituents, increasing subgrid-wide dispersive memory.
+        self.dispersive_averaging = kwargs.get("dispersive_averaging", False)
+
     def local_to_global(self, coord):
         """Converts a local (subgrid array) cell index to a physical
         position in the main grid's/global coordinate frame.
