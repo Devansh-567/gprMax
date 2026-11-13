@@ -1410,3 +1410,181 @@ def process_materials(G):
         materialsdata.append(materialtext)
 
     return materialsdata
+class MagneticDispersiveMaterial(Material):
+    """Class to describe materials with frequency dependent magnetic properties,
+    e.g. magnetic Debye, magnetic Lorentz, magnetic Drude.
+
+    Magnetic dispersion is less common but important for magnetic materials
+    at microwave frequencies. The modeling follows the same recursive
+    formulation as electric dispersive materials.
+    """
+
+    def __init__(self, numID, ID):
+        super().__init__(numID, ID)
+        self.poles = 0
+        self.mdeltaer = []
+        self.mtau = []
+        self.malpha = []
+        self.minclusive_w = []
+        self.minclusive_q = []
+        self.minclusive_conductivity = 0.0
+
+    def calculate_update_coeffsH(self, G):
+        """Calculates the magnetic update coefficients of the material.
+
+        The implementation of the magnetic dispersive material modelling comes
+        from the derivation in: http://dx.doi.org/10.1109/TAP.2014.2308549
+        """
+
+        from gprMax.materials import _validate_evaluation_frequency
+
+        # Initialize working arrays
+        self.w = np.zeros(
+            G.maxpoles,
+            dtype=G.dispersivedtype,
+        )
+        self.q = np.zeros(
+            G.maxpoles,
+            dtype=G.dispersivedtype,
+        )
+        self.zt = np.zeros(
+            G.maxpoles,
+            dtype=G.dispersivedtype,
+        )
+        self.zt2 = np.zeros(
+            G.maxpoles,
+            dtype=G.dispersivedtype,
+        )
+        self.eqt = np.zeros(
+            G.maxpoles,
+            dtype=G.dispersivedtype,
+        )
+        self.eqt2 = np.zeros(
+            G.maxpoles,
+            dtype=G.dispersivedtype,
+        )
+
+        # The magnetic susceptibility contains a constant causal term whose
+        # time derivative is equivalent to a magnetic conductivity. Keep
+        # that numerical conductivity local: ``self.sm`` is the physical
+        # conductivity supplied by the user and must neither be overwritten
+        # nor accumulated if coefficients are calculated more than once.
+        effective_sm = self.sm
+        coefficient_type = np.result_type(G.dispersivedtype, np.float64).type
+
+        for x in range(self.poles):
+            if self.minclusive_w:
+                w = self.minclusive_w[x]
+                q = self.minclusive_q[x] if x < len(self.minclusive_q) else 0.0
+            elif "magneticdebye" in self.type:
+                w = self.mdeltaer[x] / self.mtau[x]
+                q = -1 / self.mtau[x]
+            elif "magneticlorentz" in self.type:
+                # tau for magnetic materials are pole frequencies
+                # alpha for magnetic materials are the damping coefficients
+                wp2 = (2 * np.pi * self.mtau[x]) ** 2
+                w = -1j * ((wp2 * self.mdeltaer[x]) / np.sqrt(wp2 - self.malpha[x] ** 2))
+                q = -self.malpha[x] + (1j * np.sqrt(wp2 - self.malpha[x] ** 2))
+            elif "magneticdrude" in self.type:
+                # tau for magnetic materials are pole frequencies
+                # alpha for magnetic materials are the inverse of relaxation times
+                wp2 = (2 * np.pi * self.mtau[x]) ** 2
+                effective_sm += coefficient_type(config.m0 * wp2 / self.malpha[x])
+                w = -(wp2 / self.malpha[x])
+                q = -self.malpha[x]
+            else:
+                raise ValueError(f"Unknown magnetic dispersive material type {self.type!r}")
+
+            # Form exponential differences before rounding to field precision.
+            # 1 - exp(q*dt) can otherwise vanish for a valid, slow pole.
+            w, q = coefficient_type(w), coefficient_type(q)
+            self.w[x], self.q[x] = w, q
+            increment = q * G.dt
+            self.eqt[x] = np.exp(increment)
+            self.eqt2[x] = np.exp(increment / 2)
+            self.zt[x] = -(w / q) * np.expm1(increment) / G.dt
+            self.zt2[x] = -(w / q) * np.expm1(increment / 2)
+            unresolved_decay |= bool(w != 0 and q.real < 0 and self.eqt[x] == 1)
+
+        if unresolved_decay:
+            logger.warning(
+                f"Material {self.ID!r}: a pole decay multiplier rounds to one at the selected "
+                "precision. Pole coupling is retained, but long-time decay may be inaccurate; "
+                "use double precision or check convergence for these relaxation times."
+            )
+
+        # Update magnetic coefficients
+        HA = (config.m0 * self.mr / G.dt) + 0.5 * (self.sm + effective_sm)
+        HB = (config.m0 * self.mr / G.dt) - 0.5 * (self.sm + effective_sm)
+
+        if self.ID == "pmc" or (self.sm + effective_sm) == float("inf"):
+            self.DA = 0
+            self.DBx = 0
+            self.DBy = 0
+            self.DBz = 0
+            self.srcm = 0
+        else:
+            self.DA = HB / HA
+            self.DBx = (1 / G.dx) * 1 / HA
+            self.DBy = (1 / G.dy) * 1 / HA
+            self.DBz = (1 / G.dz) * 1 / HA
+            self.srcm = 1 / HA
+
+    def calculate_hr(self, freq):
+        """Calculates the complex relative permeability at a specific frequency.
+
+        Args:
+            freq: float for frequency used to calculate complex relative
+                permeability. Finite real frequency; DC returns the static value.
+
+        Returns:
+            hr: float for complex relative permeability.
+        """
+        _validate_evaluation_frequency(freq, self.ID)
+
+        values = np.asarray(freq, dtype=np.float64)
+        if np.any(values == 0):
+            if self.sm != 0 or self.minclusive_conductivity != 0:
+                raise ValueError(
+                    f"Material {self.ID!r} includes magnetic conductivity, "
+                    "which is singular at zero frequency (DC)."
+                )
+            if "magneticdrude" in self.type and self.poles:
+                raise ValueError(
+                    f"Material {self.ID!r} includes a magnetic Drude pole, "
+                    "which is singular at zero frequency (DC)."
+                )
+            if self.minclusive_w and any(pole_q == 0 for pole_q in self.minclusive_q):
+                raise ValueError(
+                    f"Material {self.ID!r} includes a magnetic pole at the origin, "
+                    "which is singular at zero frequency (DC)."
+                )
+
+        # Permeability at infinite frequency
+        hr = self.mr
+
+        w = 2 * np.pi * freq
+        if self.sm != 0:
+            hr += self.sm / (1j * w * config.m0)
+        if self.minclusive_w:
+            if self.minclusive_conductivity != 0:
+                hr += self.minclusive_conductivity / (1j * w * config.m0)
+            for pole_w, pole_q in zip(self.minclusive_w, self.minclusive_q):
+                if np.isclose(np.imag(pole_w), 0.0) and np.isclose(np.imag(pole_q), 0.0):
+                    hr += np.real(pole_w) / (1j * w - np.real(pole_q))
+                else:
+                    hr += 0.5 * (
+                        pole_w / (1j * w - pole_q)
+                        + np.conjugate(pole_w) / (1j * w - np.conjugate(pole_q))
+                    )
+        elif "magneticdebye" in self.type:
+            for pole in range(self.poles):
+                hr += self.mdeltaer[pole] / (1 + 1j * w * self.mtau[pole])
+        elif "magneticlorentz" in self.type:
+            for pole in range(self.poles):
+                pole_omega = 2 * np.pi * self.mtau[pole]
+                hr += self.mdeltaer[pole] / (pole_omega ** 2 - w ** 2 + 1j * self.malpha[pole] * w)
+        elif "magneticdrude" in self.type:
+            hr += self.sm / (1j * w * config.m0) if self.sm else 0.0
+
+        return hr
